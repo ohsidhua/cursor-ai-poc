@@ -1,0 +1,302 @@
+name: 🧪 Auto Test Generator
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      target_class:
+        description: 'Specific class to generate tests for (optional)'
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  generate-tests:
+    if: |
+      github.event_name == 'workflow_dispatch' || 
+      (github.event_name == 'pull_request' && github.event.label.name == 'generate-tests')
+    
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          
+      - name: 📦 Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli
+          sf version
+          
+      - name: 🔍 Find Classes Without Tests
+        id: find-classes
+        run: |
+          echo "Scanning for classes without tests..."
+          
+          CLASSES_WITHOUT_TESTS=""
+          
+          # Find all Apex classes (excluding test classes)
+          for class_file in $(find force-app -name "*.cls" ! -name "*Test.cls" -type f); do
+            class_name=$(basename "$class_file" .cls)
+            test_file="${class_file%/*}/${class_name}Test.cls"
+            
+            if [ ! -f "$test_file" ]; then
+              CLASSES_WITHOUT_TESTS="$CLASSES_WITHOUT_TESTS$class_file\n"
+              echo "❌ Missing test: $class_name"
+            else
+              echo "✅ Has test: $class_name"
+            fi
+          done
+          
+          echo "classes<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$CLASSES_WITHOUT_TESTS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          if [ -z "$CLASSES_WITHOUT_TESTS" ]; then
+            echo "has_missing_tests=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_missing_tests=true" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: 🔧 Install jq (for JSON parsing)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          
+      - name: 🤖 Generate Test Classes
+        if: steps.find-classes.outputs.has_missing_tests == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "🤖 Generating test classes with AI..."
+          
+          CLASSES="${{ steps.find-classes.outputs.classes }}"
+          GENERATED_COUNT=0
+          
+          echo "$CLASSES" | while IFS= read -r class_file; do
+            if [ -z "$class_file" ] || [ ! -f "$class_file" ]; then
+              continue
+            fi
+            
+            class_name=$(basename "$class_file" .cls)
+            test_file="${class_file%/*}/${class_name}Test.cls"
+            test_meta="${class_file%/*}/${class_name}Test.cls-meta.xml"
+            
+            echo "Generating test for: $class_name"
+            
+            CLASS_CONTENT=$(cat "$class_file")
+            
+            # Create comprehensive test generation prompt
+            TEST_PROMPT="You are an expert Salesforce test developer. Generate a comprehensive Apex test class for the following Salesforce class.
+
+CLASS TO TEST: $class_name
+
+SOURCE CODE:
+\`\`\`apex
+$CLASS_CONTENT
+\`\`\`
+
+REQUIREMENTS:
+1. Test class name must be exactly: ${class_name}Test
+2. Use @isTest annotation at class level
+3. Include @TestSetup method to create test data if needed
+4. Cover ALL public and global methods
+5. Include positive test scenarios
+6. Include negative test scenarios (error handling)
+7. Include bulk test scenarios (200 records)
+8. Use Test.startTest() and Test.stopTest() appropriately
+9. Use System.assert, System.assertEquals with descriptive messages
+10. Mock any external callouts using Test.setMock()
+11. Aim for 100% code coverage
+12. Follow Salesforce best practices
+13. Add JSDoc comments explaining each test method
+
+OUTPUT FORMAT:
+- Provide ONLY the complete Apex test class code
+- No explanations or markdown formatting
+- Start with /** class comment */ and end with final }
+- Include all necessary imports and annotations"
+
+            # Escape prompt for JSON
+            ESCAPED_PROMPT=$(echo "$TEST_PROMPT" | jq -Rs .)
+            
+            # Generate test class using OpenAI API
+            RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $OPENAI_API_KEY" \
+              -d "{
+                \"model\": \"gpt-4\",
+                \"messages\": [
+                  {
+                    \"role\": \"system\",
+                    \"content\": \"You are an expert Salesforce test developer. Generate complete, production-ready Apex test classes.\"
+                  },
+                  {
+                    \"role\": \"user\",
+                    \"content\": $ESCAPED_PROMPT
+                  }
+                ],
+                \"temperature\": 0.2,
+                \"max_tokens\": 4000
+              }")
+            
+            # Extract test class code
+            TEST_CODE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ""')
+            
+            # Clean up markdown code blocks if present
+            TEST_CODE=$(echo "$TEST_CODE" | sed -n '/```apex/,/```/p' | sed '1d;$d' || echo "$TEST_CODE")
+            
+            echo "$TEST_CODE" > "$test_file"
+            
+            # Verify the file was created and has content
+            if [ -s "$test_file" ]; then
+              # Create meta.xml file
+              cat > "$test_meta" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>60.0</apiVersion>
+    <status>Active</status>
+</ApexClass>
+EOF
+              
+              echo "✅ Generated: $test_file"
+              GENERATED_COUNT=$((GENERATED_COUNT + 1))
+            else
+              echo "❌ Failed to generate: $test_file"
+              rm -f "$test_file"
+            fi
+          done
+          
+          echo "GENERATED_COUNT=$GENERATED_COUNT" >> $GITHUB_ENV
+          
+      - name: 🔍 Validate Generated Tests
+        if: steps.find-classes.outputs.has_missing_tests == 'true'
+        run: |
+          echo "🔍 Validating generated test classes..."
+          
+          # Check syntax of generated tests
+          for test_file in $(find force-app -name "*Test.cls" -type f); do
+            if [ -f "$test_file" ]; then
+              # Basic validation - check for required elements
+              if grep -q "@isTest" "$test_file" && grep -q "class" "$test_file"; then
+                echo "✅ Valid syntax: $(basename $test_file)"
+              else
+                echo "⚠️  Potential issues: $(basename $test_file)"
+              fi
+            fi
+          done
+          
+      - name: 📊 Generate Test Report
+        if: steps.find-classes.outputs.has_missing_tests == 'true'
+        run: |
+          cat > test-generation-report.md << 'EOF'
+# 🧪 Test Generation Report
+
+## Summary
+- **Tests Generated**: ${{ env.GENERATED_COUNT }}
+- **Timestamp**: $(date)
+- **Triggered By**: ${{ github.actor }}
+
+## Generated Test Classes
+
+EOF
+          
+          for test_file in $(find force-app -name "*Test.cls" -type f -newer .git); do
+            if [ -f "$test_file" ]; then
+              test_name=$(basename "$test_file" .cls)
+              lines=$(wc -l < "$test_file")
+              echo "- ✅ \`$test_name\` ($lines lines)" >> test-generation-report.md
+            fi
+          done
+          
+          cat >> test-generation-report.md << 'EOF'
+
+## Next Steps
+
+1. **Review Generated Tests**: Carefully review each generated test class
+2. **Validate Logic**: Ensure test assertions match expected behavior
+3. **Run Tests**: Execute tests in your Salesforce org
+4. **Check Coverage**: Verify code coverage meets requirements (85%+)
+5. **Refine**: Adjust tests as needed for your specific use cases
+
+## Important Notes
+
+⚠️ **AI-generated tests should always be reviewed by a human before deployment**
+- Verify test data setup is appropriate
+- Ensure assertions validate correct behavior
+- Check for any security or privacy concerns
+- Validate bulk processing scenarios
+
+---
+*🤖 Generated by AI Test Generator - Powered by OpenAI GPT-4*
+EOF
+          
+      - name: 💾 Commit Generated Tests
+        if: steps.find-classes.outputs.has_missing_tests == 'true'
+        run: |
+          git config user.name "Cursor AI Bot"
+          git config user.email "cursor-ai@github-actions"
+          
+          git add force-app/**/*Test.cls*
+          git add test-generation-report.md
+          
+          if git diff --staged --quiet; then
+            echo "No tests to commit"
+          else
+            git commit -m "🤖 Auto-generate test classes via AI
+
+Generated ${{ env.GENERATED_COUNT }} test classes
+            
+Co-authored-by: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>"
+            
+            git push
+            echo "✅ Tests committed and pushed"
+          fi
+          
+      - name: 💬 Post Results Comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let comment = '';
+            
+            if (fs.existsSync('test-generation-report.md')) {
+              comment = fs.readFileSync('test-generation-report.md', 'utf8');
+            } else if ('${{ steps.find-classes.outputs.has_missing_tests }}' === 'false') {
+              comment = '✅ **All classes already have test coverage!**\n\nNo test generation needed.';
+            } else {
+              comment = '❌ **Test generation failed**\n\nPlease check the workflow logs for details.';
+            }
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+            
+      - name: 📤 Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: generated-tests
+          path: |
+            force-app/**/*Test.cls
+            test-generation-report.md
+          retention-days: 30
+

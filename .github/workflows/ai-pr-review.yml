@@ -1,0 +1,281 @@
+name: 🤖 AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'force-app/**/*.cls'
+      - 'force-app/**/*.trigger'
+      - 'force-app/**/*.js'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  ai-code-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: 🔍 Get Changed Files
+        id: changed-files
+        run: |
+          echo "Fetching changed files..."
+          git fetch origin ${{ github.base_ref }}
+          
+          APEX_FILES=$(git diff --name-only origin/${{ github.base_ref }} HEAD | grep -E '\.(cls|trigger)$' || echo "")
+          JS_FILES=$(git diff --name-only origin/${{ github.base_ref }} HEAD | grep -E '\.js$' || echo "")
+          
+          echo "apex_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$APEX_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "js_files<<EOF" >> $GITHUB_OUTPUT
+          echo "$JS_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          if [ -z "$APEX_FILES" ] && [ -z "$JS_FILES" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: 🔧 Install jq (for JSON parsing)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          
+      - name: 🧠 AI Analysis - Code Review
+        if: steps.changed-files.outputs.has_changes == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "# 🤖 AI Code Review" > review.md
+          echo "" >> review.md
+          echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> review.md
+          echo "" >> review.md
+          
+          APEX_FILES="${{ steps.changed-files.outputs.apex_files }}"
+          
+          if [ ! -z "$APEX_FILES" ]; then
+            echo "## 📊 Apex Code Analysis" >> review.md
+            echo "" >> review.md
+            
+            echo "$APEX_FILES" | while IFS= read -r file; do
+              if [ ! -z "$file" ] && [ -f "$file" ]; then
+                echo "### 📄 \`$file\`" >> review.md
+                echo "" >> review.md
+                
+                FILE_CONTENT=$(cat "$file")
+                
+                # Create analysis using OpenAI API
+                PROMPT_CONTENT="Analyze this Salesforce Apex code for:
+
+1. **Critical Issues** (Must Fix):
+   - SOQL/DML in loops
+   - Missing bulkification
+   - Security vulnerabilities (SOQL injection, missing sharing rules)
+   - Hardcoded credentials or IDs
+   - Missing error handling
+
+2. **Governor Limits**:
+   - SOQL query efficiency
+   - DML statement usage
+   - CPU time concerns
+   - Heap size issues
+
+3. **Best Practices**:
+   - Code organization
+   - Naming conventions
+   - Documentation
+   - Test coverage considerations
+
+4. **Performance**:
+   - Query selectivity
+   - Collection usage
+   - Unnecessary operations
+
+5. **Recommendations**:
+   - Specific code improvements
+   - Refactoring suggestions
+   - Testing strategy
+
+File: $file
+
+Code:
+\`\`\`apex
+$FILE_CONTENT
+\`\`\`
+
+Format your response as markdown with clear sections."
+                
+                ESCAPED_PROMPT=$(echo "$PROMPT_CONTENT" | jq -Rs .)
+                
+                RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer $OPENAI_API_KEY" \
+                  -d "{
+                    \"model\": \"gpt-4\",
+                    \"messages\": [
+                      {
+                        \"role\": \"system\",
+                        \"content\": \"You are an expert Salesforce Apex code reviewer. Provide detailed, actionable feedback with specific line numbers and code examples.\"
+                      },
+                      {
+                        \"role\": \"user\",
+                        \"content\": $ESCAPED_PROMPT
+                      }
+                    ],
+                    \"temperature\": 0.3,
+                    \"max_tokens\": 2000
+                  }")
+                
+                # Extract content from response
+                ANALYSIS=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "⚠️ AI analysis unavailable. Please check API key configuration."')
+                
+                if [ "$ANALYSIS" != "null" ] && [ ! -z "$ANALYSIS" ]; then
+                  echo "$ANALYSIS" >> review.md
+                else
+                  echo "⚠️ *AI analysis unavailable for this file*" >> review.md
+                fi
+                
+                echo "" >> review.md
+                echo "---" >> review.md
+                echo "" >> review.md
+              fi
+            done
+          fi
+          
+      - name: 📊 Generate Complexity Metrics
+        if: steps.changed-files.outputs.has_changes == 'true'
+        run: |
+          echo "" >> review.md
+          echo "## 📈 Code Complexity Metrics" >> review.md
+          echo "" >> review.md
+          
+          APEX_FILES="${{ steps.changed-files.outputs.apex_files }}"
+          
+          if [ ! -z "$APEX_FILES" ]; then
+            echo "| File | Lines | Methods | Cyclomatic Complexity |" >> review.md
+            echo "|------|-------|---------|----------------------|" >> review.md
+            
+            echo "$APEX_FILES" | while IFS= read -r file; do
+              if [ ! -z "$file" ] && [ -f "$file" ]; then
+                LINES=$(wc -l < "$file" 2>/dev/null || echo "0")
+                METHODS=$(grep -c "^\s*\(public\|private\|global\|protected\).*(" "$file" 2>/dev/null || echo "0")
+                COMPLEXITY=$(grep -c "if\|for\|while\|switch\|catch" "$file" 2>/dev/null || echo "0")
+                echo "| \`$(basename $file)\` | $LINES | $METHODS | $COMPLEXITY |" >> review.md
+              fi
+            done
+          fi
+          
+      - name: 🎯 AI Summary and Action Items
+        if: steps.changed-files.outputs.has_changes == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "" >> review.md
+          echo "## 🎯 Summary and Action Items" >> review.md
+          echo "" >> review.md
+          
+          REVIEW_CONTENT=$(cat review.md | head -c 8000)  # Limit to avoid token limits
+          
+          SUMMARY_PROMPT="Based on this code review, provide:
+
+1. **Overall Assessment**: Rate code quality (1-10)
+2. **Critical Actions**: Must-fix issues before merge
+3. **Recommended Actions**: Should-fix for better quality
+4. **Optional Improvements**: Nice-to-have enhancements
+5. **Approval Recommendation**: Should this PR be approved?
+
+Review:
+$REVIEW_CONTENT"
+          
+          ESCAPED_SUMMARY_PROMPT=$(echo "$SUMMARY_PROMPT" | jq -Rs .)
+          
+          SUMMARY_RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "{
+              \"model\": \"gpt-4\",
+              \"messages\": [
+                {
+                  \"role\": \"system\",
+                  \"content\": \"You are a code review summarizer. Provide clear, actionable summaries.\"
+                },
+                {
+                  \"role\": \"user\",
+                  \"content\": $ESCAPED_SUMMARY_PROMPT
+                }
+              ],
+              \"temperature\": 0.2,
+              \"max_tokens\": 1000
+            }")
+          
+          SUMMARY=$(echo "$SUMMARY_RESPONSE" | jq -r '.choices[0].message.content // "⚠️ Summary unavailable"')
+          echo "$SUMMARY" >> review.md
+          
+      - name: 💬 Post Review Comment
+        if: steps.changed-files.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let review = '';
+            
+            try {
+              review = fs.readFileSync('review.md', 'utf8');
+            } catch (error) {
+              review = '⚠️ Unable to generate AI review. Please check workflow logs and API key configuration.';
+            }
+            
+            // Add footer
+            review += '\n\n---\n';
+            review += '*🤖 This review was generated automatically. Please verify all suggestions before implementing.*\n';
+            review += '*⚡ Powered by OpenAI GPT-4 + GitHub Actions*';
+            
+            // Find existing bot comment
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.data.find(comment => 
+              comment.user.type === 'Bot' && comment.body.includes('🤖 AI Code Review')
+            );
+            
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: review
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: review
+              });
+            }
+            
+      - name: 📤 Upload Review Artifact
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: code-review
+          path: review.md
+          retention-days: 30
+

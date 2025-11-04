@@ -1,0 +1,155 @@
+name: 📊 Test Coverage Report
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'force-app/**/*.cls'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: 🔍 Analyze Test Coverage
+        id: coverage
+        run: |
+          echo "# 📊 Test Coverage Report" > coverage-report.md
+          echo "" >> coverage-report.md
+          echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> coverage-report.md
+          echo "" >> coverage-report.md
+          
+          # Find all Apex classes
+          echo "## 📈 Coverage Summary" >> coverage-report.md
+          echo "" >> coverage-report.md
+          
+          TOTAL_CLASSES=0
+          CLASSES_WITH_TESTS=0
+          CLASSES_WITHOUT_TESTS=""
+          
+          for class_file in $(find force-app -name "*.cls" ! -name "*Test.cls" -type f); do
+            TOTAL_CLASSES=$((TOTAL_CLASSES + 1))
+            class_name=$(basename "$class_file" .cls)
+            test_file="${class_file%/*}/${class_name}Test.cls"
+            
+            if [ -f "$test_file" ]; then
+              CLASSES_WITH_TESTS=$((CLASSES_WITH_TESTS + 1))
+              echo "✅ $class_name" >> coverage-report.md
+            else
+              CLASSES_WITHOUT_TESTS="$CLASSES_WITHOUT_TESTS\n- \`$class_name\`"
+              echo "❌ $class_name - **Missing test class**" >> coverage-report.md
+            fi
+          done
+          
+          COVERAGE_PERCENT=$((CLASSES_WITH_TESTS * 100 / TOTAL_CLASSES))
+          
+          echo "" >> coverage-report.md
+          echo "### Statistics" >> coverage-report.md
+          echo "" >> coverage-report.md
+          echo "| Metric | Value |" >> coverage-report.md
+          echo "|--------|-------|" >> coverage-report.md
+          echo "| Total Classes | $TOTAL_CLASSES |" >> coverage-report.md
+          echo "| Classes with Tests | $CLASSES_WITH_TESTS |" >> coverage-report.md
+          echo "| Coverage Percentage | **$COVERAGE_PERCENT%** |" >> coverage-report.md
+          echo "" >> coverage-report.md
+          
+          if [ ! -z "$CLASSES_WITHOUT_TESTS" ]; then
+            echo "## ⚠️ Classes Missing Tests" >> coverage-report.md
+            echo "" >> coverage-report.md
+            echo -e "$CLASSES_WITHOUT_TESTS" >> coverage-report.md
+            echo "" >> coverage-report.md
+            echo "💡 **Tip**: Add the \`generate-tests\` label to this PR to auto-generate test classes." >> coverage-report.md
+          fi
+          
+          echo "" >> coverage-report.md
+          echo "---" >> coverage-report.md
+          echo "*📊 This report is generated automatically for QA review*" >> coverage-report.md
+          
+          # Set output for summary
+          echo "coverage_percent=$COVERAGE_PERCENT" >> $GITHUB_OUTPUT
+          echo "classes_without_tests=$((TOTAL_CLASSES - CLASSES_WITH_TESTS))" >> $GITHUB_OUTPUT
+          
+      - name: 💬 Post Coverage Report
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let report = '';
+            
+            try {
+              report = fs.readFileSync('coverage-report.md', 'utf8');
+            } catch (error) {
+              report = '⚠️ Unable to generate coverage report.';
+            }
+            
+            // Find existing coverage comment
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const coverageComment = comments.data.find(comment => 
+              comment.user.type === 'Bot' && comment.body.includes('📊 Test Coverage Report')
+            );
+            
+            if (coverageComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: coverageComment.id,
+                body: report
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: report
+              });
+            }
+            
+            // Set PR status based on coverage
+            const coveragePercent = '${{ steps.coverage.outputs.coverage_percent }}';
+            const missingTests = '${{ steps.coverage.outputs.classes_without_tests }}';
+            
+            if (parseInt(coveragePercent) < 75 || parseInt(missingTests) > 0) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: context.payload.pull_request.head.sha,
+                state: 'failure',
+                context: 'test-coverage',
+                description: `Coverage: ${coveragePercent}% - ${missingTests} classes missing tests`
+              });
+            } else {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: context.payload.pull_request.head.sha,
+                state: 'success',
+                context: 'test-coverage',
+                description: `Coverage: ${coveragePercent}% - All classes have tests`
+              });
+            }
+            
+      - name: 📤 Upload Coverage Artifact
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage-report.md
+          retention-days: 30
+

@@ -1,0 +1,33 @@
+# Salesforce
+.sf/
+.sfdx/
+.localdevserver/
+config/
+coverage/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Secrets
+.env
+*.key
+authUrl.txt
+
+# Test artifacts
+test-results/
+*.xml
+
