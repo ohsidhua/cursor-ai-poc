@@ -26,7 +26,7 @@ jobs:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
           
@@ -86,7 +86,8 @@ jobs:
           CLASSES="${{ steps.find-classes.outputs.classes }}"
           GENERATED_COUNT=0
           
-          echo "$CLASSES" | while IFS= read -r class_file; do
+          # Use process substitution to avoid subshell issues
+          while IFS= read -r class_file; do
             if [ -z "$class_file" ] || [ ! -f "$class_file" ]; then
               continue
             fi
@@ -157,30 +158,36 @@ OUTPUT FORMAT:
             TEST_CODE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ""')
             
             # Clean up markdown code blocks if present
-            TEST_CODE=$(echo "$TEST_CODE" | sed -n '/```apex/,/```/p' | sed '1d;$d' || echo "$TEST_CODE")
+            if echo "$TEST_CODE" | grep -q '```apex'; then
+              TEST_CODE=$(echo "$TEST_CODE" | sed -n '/```apex/,/```/p' | sed '1d;$d')
+            fi
+            
+            # Remove markdown if still present
+            TEST_CODE=$(echo "$TEST_CODE" | sed 's/^```apex$//' | sed 's/^```$//')
             
             echo "$TEST_CODE" > "$test_file"
             
             # Verify the file was created and has content
-            if [ -s "$test_file" ]; then
+            if [ -s "$test_file" ] && grep -q "@isTest\|class.*Test" "$test_file"; then
               # Create meta.xml file
-              cat > "$test_meta" << EOF
+              cat > "$test_meta" << 'METAXML'
 <?xml version="1.0" encoding="UTF-8"?>
 <ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">
     <apiVersion>60.0</apiVersion>
     <status>Active</status>
 </ApexClass>
-EOF
+METAXML
               
               echo "✅ Generated: $test_file"
               GENERATED_COUNT=$((GENERATED_COUNT + 1))
             else
               echo "❌ Failed to generate: $test_file"
-              rm -f "$test_file"
+              rm -f "$test_file" "$test_meta"
             fi
-          done
+          done <<< "$CLASSES"
           
           echo "GENERATED_COUNT=$GENERATED_COUNT" >> $GITHUB_ENV
+          echo "Generated $GENERATED_COUNT test class(es)"
           
       - name: 🔍 Validate Generated Tests
         if: steps.find-classes.outputs.has_missing_tests == 'true'
@@ -214,10 +221,11 @@ EOF
 
 EOF
           
-          for test_file in $(find force-app -name "*Test.cls" -type f -newer .git); do
+          # Find newly generated test files (created in this workflow run)
+          for test_file in $(find force-app -name "*Test.cls" -type f); do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .cls)
-              lines=$(wc -l < "$test_file")
+              lines=$(wc -l < "$test_file" 2>/dev/null || echo "0")
               echo "- ✅ \`$test_name\` ($lines lines)" >> test-generation-report.md
             fi
           done
@@ -275,9 +283,11 @@ Co-authored-by: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.co
             const fs = require('fs');
             let comment = '';
             
+            const hasMissingTests = '${{ steps.find-classes.outputs.has_missing_tests }}';
+            
             if (fs.existsSync('test-generation-report.md')) {
               comment = fs.readFileSync('test-generation-report.md', 'utf8');
-            } else if ('${{ steps.find-classes.outputs.has_missing_tests }}' === 'false') {
+            } else if (hasMissingTests === 'false') {
               comment = '✅ **All classes already have test coverage!**\n\nNo test generation needed.';
             } else {
               comment = '❌ **Test generation failed**\n\nPlease check the workflow logs for details.';
