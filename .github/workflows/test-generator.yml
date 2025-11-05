@@ -26,7 +26,7 @@ jobs:
       - name: 📥 Checkout Code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
           
@@ -43,26 +43,27 @@ jobs:
           
       - name: 🔍 Find Classes Without Tests
         id: find-classes
+        shell: bash
         run: |
           echo "Scanning for classes without tests..."
           
           CLASSES_WITHOUT_TESTS=""
           
           # Find all Apex classes (excluding test classes)
-          for class_file in $(find force-app -name "*.cls" ! -name "*Test.cls" -type f); do
+          while IFS= read -r -d '' class_file; do
             class_name=$(basename "$class_file" .cls)
             test_file="${class_file%/*}/${class_name}Test.cls"
             
             if [ ! -f "$test_file" ]; then
-              CLASSES_WITHOUT_TESTS="$CLASSES_WITHOUT_TESTS$class_file\n"
+              CLASSES_WITHOUT_TESTS="${CLASSES_WITHOUT_TESTS}${class_file}"$'\n'
               echo "❌ Missing test: $class_name"
             else
               echo "✅ Has test: $class_name"
             fi
-          done
+          done < <(find force-app -name "*.cls" ! -name "*Test.cls" -type f -print0)
           
           echo "classes<<EOF" >> $GITHUB_OUTPUT
-          echo -e "$CLASSES_WITHOUT_TESTS" >> $GITHUB_OUTPUT
+          printf "%s" "$CLASSES_WITHOUT_TESTS" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
           
           if [ -z "$CLASSES_WITHOUT_TESTS" ]; then
@@ -80,13 +81,15 @@ jobs:
         if: steps.find-classes.outputs.has_missing_tests == 'true'
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
         run: |
           echo "🤖 Generating test classes with AI..."
           
           CLASSES="${{ steps.find-classes.outputs.classes }}"
           GENERATED_COUNT=0
           
-          echo "$CLASSES" | while IFS= read -r class_file; do
+          # Process classes without using pipe to avoid subshell
+          while IFS= read -r class_file; do
             if [ -z "$class_file" ] || [ ! -f "$class_file" ]; then
               continue
             fi
@@ -97,7 +100,17 @@ jobs:
             
             echo "Generating test for: $class_name"
             
+            if [ ! -f "$class_file" ]; then
+              echo "⚠️  Class file not found: $class_file"
+              continue
+            fi
+            
             CLASS_CONTENT=$(cat "$class_file")
+            
+            if [ -z "$CLASS_CONTENT" ]; then
+              echo "⚠️  Empty class file: $class_file"
+              continue
+            fi
             
             # Create comprehensive test generation prompt
             TEST_PROMPT="You are an expert Salesforce test developer. Generate a comprehensive Apex test class for the following Salesforce class.
@@ -131,10 +144,18 @@ OUTPUT FORMAT:
 - Include all necessary imports and annotations"
 
             # Escape prompt for JSON
-            ESCAPED_PROMPT=$(echo "$TEST_PROMPT" | jq -Rs .)
+            if ! ESCAPED_PROMPT=$(echo "$TEST_PROMPT" | jq -Rs .); then
+              echo "❌ Failed to escape prompt for $class_name"
+              continue
+            fi
             
             # Generate test class using OpenAI API
-            RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+            if [ -z "$OPENAI_API_KEY" ]; then
+              echo "❌ OPENAI_API_KEY is not set"
+              exit 1
+            fi
+            
+            RESPONSE=$(curl -s -w "\n%{http_code}" https://api.openai.com/v1/chat/completions \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer $OPENAI_API_KEY" \
               -d "{
@@ -153,24 +174,50 @@ OUTPUT FORMAT:
                 \"max_tokens\": 4000
               }")
             
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "❌ API call failed with HTTP $HTTP_CODE for $class_name"
+              echo "Response: $RESPONSE_BODY"
+              continue
+            fi
+            
             # Extract test class code
-            TEST_CODE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ""')
+            TEST_CODE=$(echo "$RESPONSE_BODY" | jq -r '.choices[0].message.content // ""')
+            
+            if [ -z "$TEST_CODE" ]; then
+              echo "❌ No test code generated for $class_name"
+              continue
+            fi
             
             # Clean up markdown code blocks if present
-            TEST_CODE=$(echo "$TEST_CODE" | sed -n '/```apex/,/```/p' | sed '1d;$d' || echo "$TEST_CODE")
+            if echo "$TEST_CODE" | grep -q '```apex'; then
+              TEST_CODE=$(echo "$TEST_CODE" | sed -n '/```apex/,/```/p' | sed '1d;$d')
+            elif echo "$TEST_CODE" | grep -q '```'; then
+              TEST_CODE=$(echo "$TEST_CODE" | sed -n '/```/,/```/p' | sed '1d;$d')
+            fi
+            
+            # Remove leading/trailing whitespace
+            TEST_CODE=$(echo "$TEST_CODE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            
+            if [ -z "$TEST_CODE" ]; then
+              echo "❌ Test code is empty after cleanup for $class_name"
+              continue
+            fi
             
             echo "$TEST_CODE" > "$test_file"
             
             # Verify the file was created and has content
             if [ -s "$test_file" ]; then
               # Create meta.xml file
-              cat > "$test_meta" << EOF
+              cat > "$test_meta" << 'METAXML'
 <?xml version="1.0" encoding="UTF-8"?>
 <ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">
     <apiVersion>60.0</apiVersion>
     <status>Active</status>
 </ApexClass>
-EOF
+METAXML
               
               echo "✅ Generated: $test_file"
               GENERATED_COUNT=$((GENERATED_COUNT + 1))
@@ -178,49 +225,62 @@ EOF
               echo "❌ Failed to generate: $test_file"
               rm -f "$test_file"
             fi
-          done
+          done <<< "$CLASSES"
           
           echo "GENERATED_COUNT=$GENERATED_COUNT" >> $GITHUB_ENV
+          echo "Generated $GENERATED_COUNT test classes"
           
       - name: 🔍 Validate Generated Tests
         if: steps.find-classes.outputs.has_missing_tests == 'true'
+        shell: bash
         run: |
           echo "🔍 Validating generated test classes..."
           
           # Check syntax of generated tests
-          for test_file in $(find force-app -name "*Test.cls" -type f); do
+          while IFS= read -r -d '' test_file; do
             if [ -f "$test_file" ]; then
               # Basic validation - check for required elements
               if grep -q "@isTest" "$test_file" && grep -q "class" "$test_file"; then
-                echo "✅ Valid syntax: $(basename $test_file)"
+                echo "✅ Valid syntax: $(basename "$test_file")"
               else
-                echo "⚠️  Potential issues: $(basename $test_file)"
+                echo "⚠️  Potential issues: $(basename "$test_file")"
               fi
             fi
-          done
+          done < <(find force-app -name "*Test.cls" -type f -print0)
           
       - name: 📊 Generate Test Report
         if: steps.find-classes.outputs.has_missing_tests == 'true'
+        shell: bash
         run: |
-          cat > test-generation-report.md << 'EOF'
+          GENERATED_COUNT="${{ env.GENERATED_COUNT }}"
+          GENERATED_COUNT=${GENERATED_COUNT:-0}
+          
+          cat > test-generation-report.md << EOF
 # 🧪 Test Generation Report
 
 ## Summary
-- **Tests Generated**: ${{ env.GENERATED_COUNT }}
-- **Timestamp**: $(date)
+- **Tests Generated**: $GENERATED_COUNT
+- **Timestamp**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 - **Triggered By**: ${{ github.actor }}
 
 ## Generated Test Classes
 
 EOF
           
-          for test_file in $(find force-app -name "*Test.cls" -type f -newer .git); do
+          # Find recently created test files (created in last hour)
+          TEST_FILES_FOUND=0
+          while IFS= read -r -d '' test_file; do
             if [ -f "$test_file" ]; then
               test_name=$(basename "$test_file" .cls)
-              lines=$(wc -l < "$test_file")
+              lines=$(wc -l < "$test_file" 2>/dev/null || echo "0")
               echo "- ✅ \`$test_name\` ($lines lines)" >> test-generation-report.md
+              TEST_FILES_FOUND=$((TEST_FILES_FOUND + 1))
             fi
-          done
+          done < <(find force-app -name "*Test.cls" -type f -print0)
+          
+          if [ $TEST_FILES_FOUND -eq 0 ]; then
+            echo "- No new test files found" >> test-generation-report.md
+          fi
           
           cat >> test-generation-report.md << 'EOF'
 
@@ -267,7 +327,7 @@ Co-authored-by: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.co
           fi
           
       - name: 💬 Post Results Comment
-        if: always()
+        if: always() && (github.event_name == 'pull_request')
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -283,20 +343,25 @@ Co-authored-by: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.co
               comment = '❌ **Test generation failed**\n\nPlease check the workflow logs for details.';
             }
             
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
+            const prNumber = context.payload.pull_request?.number || context.issue?.number;
+            if (prNumber) {
+              github.rest.issues.createComment({
+                issue_number: prNumber,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
             
       - name: 📤 Upload Artifacts
-        if: always()
-        uses: actions/upload-artifact@v3
+        if: always() && steps.find-classes.outputs.has_missing_tests == 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: generated-tests
           path: |
             force-app/**/*Test.cls
+            force-app/**/*Test.cls-meta.xml
             test-generation-report.md
           retention-days: 30
+          if-no-files-found: ignore
 
