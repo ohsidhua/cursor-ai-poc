@@ -10,6 +10,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  statuses: write
 
 jobs:
   test-coverage:
@@ -52,7 +53,12 @@ jobs:
             fi
           done
           
-          COVERAGE_PERCENT=$((CLASSES_WITH_TESTS * 100 / TOTAL_CLASSES))
+          if [ $TOTAL_CLASSES -eq 0 ]; then
+            COVERAGE_PERCENT=0
+            echo "**No Apex classes found in this PR.**" >> coverage-report.md
+          else
+            COVERAGE_PERCENT=$((CLASSES_WITH_TESTS * 100 / TOTAL_CLASSES))
+          fi
           
           echo "" >> coverage-report.md
           echo "### Statistics" >> coverage-report.md
@@ -125,24 +131,29 @@ jobs:
             const coveragePercent = '${{ steps.coverage.outputs.coverage_percent }}';
             const missingTests = '${{ steps.coverage.outputs.classes_without_tests }}';
             
-            if (parseInt(coveragePercent) < 75 || parseInt(missingTests) > 0) {
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: context.payload.pull_request.head.sha,
-                state: 'failure',
-                context: 'test-coverage',
-                description: `Coverage: ${coveragePercent}% - ${missingTests} classes missing tests`
-              });
-            } else {
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: context.payload.pull_request.head.sha,
-                state: 'success',
-                context: 'test-coverage',
-                description: `Coverage: ${coveragePercent}% - All classes have tests`
-              });
+            try {
+              if (parseInt(coveragePercent) < 75 || parseInt(missingTests) > 0) {
+                await github.rest.repos.createCommitStatus({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  sha: context.payload.pull_request.head.sha,
+                  state: 'failure',
+                  context: 'test-coverage',
+                  description: `Coverage: ${coveragePercent}% - ${missingTests} classes missing tests`
+                });
+              } else {
+                await github.rest.repos.createCommitStatus({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  sha: context.payload.pull_request.head.sha,
+                  state: 'success',
+                  context: 'test-coverage',
+                  description: `Coverage: ${coveragePercent}% - All classes have tests`
+                });
+              }
+            } catch (statusError) {
+              // Gracefully handle status creation failure (may not have permission)
+              console.log('Note: Could not create commit status. This is optional and the coverage report was still posted.');
             }
             
       - name: 📤 Upload Coverage Artifact
