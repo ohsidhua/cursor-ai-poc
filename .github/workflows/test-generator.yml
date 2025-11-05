@@ -292,7 +292,7 @@ Co-authored-by: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.co
             
       - name: 📤 Upload Artifacts
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: generated-tests
           path: |
